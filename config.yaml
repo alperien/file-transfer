@@ -1,0 +1,17 @@
+paths:
+  destination: '''D:\media\Neon Genesis Evangelion'''
+  source: /root
+server:
+  host: 0.0.0.0
+  port: 5000
+ssh:
+  host: 149.28.31.195
+  key_path: ~/.ssh/id_rsa
+  password: i3P_MazVo6cKSD-j
+  port: 22
+  user: root
+transfer:
+  chunk_size: 65536
+  max_retries: 5
+  retry_delay: 5
+  timeout: 30
