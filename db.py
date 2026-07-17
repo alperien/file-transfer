@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger("db")
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "transfers.db")
+DB_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "transfers.db")
 
 _local = threading.local()
 
@@ -15,9 +15,20 @@ def get_connection():
     if not hasattr(_local, "conn") or _local.conn is None:
         conn = sqlite3.connect(DB_PATH, timeout=15, check_same_thread=False)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         _local.conn = conn
+    else:
+        try:
+            _local.conn.execute("SELECT 1")
+        except Exception:
+            try:
+                _local.conn.close()
+            except Exception:
+                pass
+            conn = sqlite3.connect(DB_PATH, timeout=15, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys=ON")
+            _local.conn = conn
     return _local.conn
 
 
@@ -27,6 +38,7 @@ def _now():
 
 def init_db():
     conn = get_connection()
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS files (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -68,8 +80,8 @@ def add_file(remote_path, local_path, size, checksum=None):
         if existing:
             if existing["status"] in ("pending", "transferring", "failed", "complete"):
                 conn.execute(
-                    "UPDATE files SET status = 'pending', local_path = ?, size = ?, updated_at = ? WHERE id = ?",
-                    (local_path, size, _now(), existing["id"]),
+                    "UPDATE files SET status = 'pending', local_path = ?, size = ?, checksum = COALESCE(?, checksum), updated_at = ? WHERE id = ?",
+                    (local_path, size, checksum, _now(), existing["id"]),
                 )
                 conn.execute(
                     "DELETE FROM progress WHERE file_id = ?", (existing["id"],)
@@ -105,7 +117,7 @@ def get_progress(file_id):
     row = conn.execute(
         "SELECT * FROM progress WHERE file_id = ?", (file_id,)
     ).fetchone()
-    return dict(row) if row else {"bytes_transferred": 0}
+    return dict(row) if row else {"file_id": file_id, "bytes_transferred": 0, "last_updated": None}
 
 
 def get_pending_files():
@@ -123,7 +135,7 @@ def get_all_files():
     rows = conn.execute(
         "SELECT f.*, COALESCE(p.bytes_transferred, 0) as bytes_transferred "
         "FROM files f LEFT JOIN progress p ON f.id = p.file_id "
-        "ORDER BY f.status, f.id"
+        "ORDER BY CASE f.status WHEN 'transferring' THEN 0 WHEN 'pending' THEN 1 WHEN 'failed' THEN 2 WHEN 'complete' THEN 3 ELSE 4 END, f.id"
     ).fetchall()
     return [dict(r) for r in rows]
 

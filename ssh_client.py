@@ -94,11 +94,7 @@ class SSHFileClient:
             transport = self.client.get_transport()
             if not transport:
                 return False
-            if transport.is_active():
-                return True
-            if transport.sock is not None and not transport.sock.closed:
-                return True
-            return False
+            return transport.is_active()
         except Exception:
             return False
 
@@ -152,14 +148,14 @@ class SSHFileClient:
                 raise ConnectionError("SFTP not connected")
             try:
                 return func(*args, **kwargs)
-            except (EOFError, OSError, paramiko.SSHException) as e:
+            except (EOFError, paramiko.SSHException) as e:
                 logger.error(f"SFTP operation failed: {e}")
-                self._mark_disconnected()
+                self._connected = False
                 raise
-
-    def _mark_disconnected(self):
-        with self._lock:
-            self._connected = False
+            except OSError as e:
+                if self._is_connection_error(e):
+                    self._connected = False
+                raise
 
     def list_files(self, remote_path):
         self._ensure_connected()
@@ -171,11 +167,21 @@ class SSHFileClient:
                 full_path = posixpath.join(remote_path, item.filename)
                 mode = item.st_mode
                 is_link = mode is not None and stat.S_ISLNK(mode)
-                is_dir = mode is not None and (stat.S_ISDIR(mode) or (is_link and (mode & 0o40000) != 0))
+                is_dir = False
+                if mode is not None:
+                    if stat.S_ISDIR(mode):
+                        is_dir = True
+                    elif is_link:
+                        try:
+                            link_stat = self._sftp_op(self.sftp.stat, full_path)
+                            is_dir = stat.S_ISDIR(link_stat.st_mode)
+                        except Exception:
+                            is_dir = False
                 entries.append({
                     "name": item.filename,
                     "path": full_path,
                     "is_dir": is_dir,
+                    "is_link": is_link,
                     "size": item.st_size if not is_dir else 0,
                     "mtime": item.st_mtime,
                 })
@@ -183,20 +189,18 @@ class SSHFileClient:
             return entries
         except Exception as e:
             if self._is_connection_error(e):
-                self._mark_disconnected()
+                self._connected = False
             raise
 
     def get_file_size(self, remote_path):
         self._ensure_connected()
         file_stat = self._sftp_op(self.sftp.stat, remote_path)
+        if file_stat.st_size is None:
+            raise Exception(f"Could not determine size of {remote_path}")
         return file_stat.st_size
 
     def download_file(self, remote_path, local_path, progress_callback=None):
         self._ensure_connected()
-        # NOTE: TOCTOU - remote_size is fetched before the actual read. The file
-        # could grow or shrink between the stat and the open/read. This is
-        # inherent to the two-step approach and cannot be fully eliminated
-        # without combining stat+open into a single atomic SFTP operation.
         remote_size = self.get_file_size(remote_path)
 
         local_tmp = local_path + ".tmp"
@@ -217,50 +221,56 @@ class SSHFileClient:
 
         chunk_size = self.config["transfer"]["chunk_size"]
 
-        try:
-            remote_file = self._sftp_op(self.sftp.open, remote_path, "rb")
-        except Exception:
+        with self._lock:
+            if not self._check_transport() or not self.sftp:
+                self._cleanup()
+                raise ConnectionError("SFTP not connected")
             try:
-                if os.path.exists(local_tmp):
-                    os.remove(local_tmp)
-            except Exception:
-                pass
-            raise
+                remote_file = self.sftp.open(remote_path, "rb")
+            except Exception as e:
+                try:
+                    if os.path.exists(local_tmp):
+                        os.remove(local_tmp)
+                except Exception:
+                    pass
+                if self._is_connection_error(e):
+                    self._connected = False
+                raise
 
-        try:
-            with remote_file:
-                if local_size > 0:
-                    remote_file.seek(local_size)
-                    logger.info(f"Resuming from {local_size} bytes")
-
-                mode = "ab" if local_size > 0 else "wb"
-                with open(local_tmp, mode) as local_file:
-                    bytes_transferred = local_size
-                    while True:
-                        chunk = remote_file.read(chunk_size)
-                        if not chunk:
-                            break
-                        local_file.write(chunk)
-                        bytes_transferred += len(chunk)
-                        if progress_callback:
-                            progress_callback(bytes_transferred, remote_size)
-
-            if bytes_transferred != remote_size:
-                raise Exception(
-                    f"Download incomplete: got {bytes_transferred}, expected {remote_size}"
-                )
-
-            return True, remote_size
-        except Exception as e:
-            if self._is_connection_error(e):
-                self._mark_disconnected()
-            logger.error(f"Download failed for {remote_path}: {e}")
             try:
-                if os.path.exists(local_tmp):
-                    os.remove(local_tmp)
-            except Exception:
-                pass
-            raise
+                with remote_file:
+                    if local_size > 0:
+                        remote_file.seek(local_size)
+                        logger.info(f"Resuming from {local_size} bytes")
+
+                    mode = "ab" if local_size > 0 else "wb"
+                    with open(local_tmp, mode) as local_file:
+                        bytes_transferred = local_size
+                        while True:
+                            chunk = remote_file.read(chunk_size)
+                            if not chunk:
+                                break
+                            local_file.write(chunk)
+                            bytes_transferred += len(chunk)
+                            if progress_callback:
+                                progress_callback(bytes_transferred, remote_size)
+
+                if bytes_transferred != remote_size:
+                    raise Exception(
+                        f"Download incomplete: got {bytes_transferred}, expected {remote_size}"
+                    )
+
+                return True, remote_size
+            except Exception as e:
+                if self._is_connection_error(e):
+                    self._connected = False
+                logger.error(f"Download failed for {remote_path}: {e}")
+                try:
+                    if os.path.exists(local_tmp):
+                        os.remove(local_tmp)
+                except Exception:
+                    pass
+                raise
 
     def get_checksum(self, remote_path):
         self._ensure_connected()
@@ -269,29 +279,41 @@ class SSHFileClient:
         md5 = hashlib.md5()
         chunk_size = self.config["transfer"]["chunk_size"]
 
-        try:
-            remote_file = self._sftp_op(self.sftp.open, remote_path, "rb")
-        except Exception:
-            raise
+        with self._lock:
+            if not self._check_transport() or not self.sftp:
+                self._cleanup()
+                raise ConnectionError("SFTP not connected")
+            try:
+                remote_file = self.sftp.open(remote_path, "rb")
+            except (EOFError, paramiko.SSHException) as e:
+                self._connected = False
+                raise
+            except OSError as e:
+                if self._is_connection_error(e):
+                    self._connected = False
+                raise
 
-        try:
-            with remote_file:
-                bytes_read = 0
-                while bytes_read < remote_size:
-                    to_read = min(chunk_size, remote_size - bytes_read)
-                    chunk = remote_file.read(to_read)
-                    if not chunk:
-                        raise Exception(
-                            f"Premature EOF reading checksum: got {bytes_read}/{remote_size} bytes"
-                        )
-                    md5.update(chunk)
-                    bytes_read += len(chunk)
+            try:
+                with remote_file:
+                    bytes_read = 0
+                    while bytes_read < remote_size:
+                        to_read = min(chunk_size, remote_size - bytes_read)
+                        chunk = remote_file.read(to_read)
+                        if not chunk:
+                            raise Exception(
+                                f"Premature EOF reading checksum: got {bytes_read}/{remote_size} bytes"
+                            )
+                        md5.update(chunk)
+                        bytes_read += len(chunk)
 
-            return md5.hexdigest()
-        except Exception as e:
-            if self._is_connection_error(e):
-                self._mark_disconnected()
-            raise
+                return md5.hexdigest()
+            except (EOFError, paramiko.SSHException) as e:
+                self._connected = False
+                raise
+            except OSError as e:
+                if self._is_connection_error(e):
+                    self._connected = False
+                raise
 
     def verify_checksum(self, local_path, expected_checksum):
         try:

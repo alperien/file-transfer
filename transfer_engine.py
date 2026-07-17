@@ -1,5 +1,6 @@
 import os
 import posixpath
+import shutil
 import threading
 import logging
 import time
@@ -10,6 +11,8 @@ from ssh_client import SSHFileClient
 logger = logging.getLogger("transfer")
 
 MAX_DIR_DEPTH = 20
+REPLACE_MAX_RETRIES = 5
+REPLACE_RETRY_DELAY = 0.5
 
 
 class TransferEngine:
@@ -22,6 +25,8 @@ class TransferEngine:
         self._lock = threading.RLock()
         self._pause_event = threading.Event()
         self._pause_event.set()
+        self._stop_event = threading.Event()
+        self._stop_event.set()
         self._current_file = None
         self._stats = {
             "completed_files": 0,
@@ -82,13 +87,15 @@ class TransferEngine:
                     continue
 
                 existing = db.get_file_by_remote(item["path"])
-                if existing and existing["status"] == "complete":
+                if existing and existing["status"] in ("complete", "pending"):
                     if os.path.exists(local_path) and os.path.getsize(local_path) == item["size"]:
+                        if existing["status"] == "pending":
+                            db.update_file_status(existing["id"], "complete")
                         continue
-                    else:
+                    elif existing["status"] == "complete":
                         db.update_file_status(existing["id"], "pending")
 
-                if os.path.exists(local_path) and os.path.getsize(local_path) == item["size"] and item["size"] > 0:
+                if os.path.exists(local_path) and os.path.getsize(local_path) == item["size"]:
                     file_id = db.add_file(item["path"], local_path, item["size"])
                     if file_id:
                         db.update_file_status(file_id, "complete")
@@ -108,8 +115,13 @@ class TransferEngine:
         with self._lock:
             if self._running:
                 return
-            if self._thread is not None:
-                self._thread.join(timeout=5)
+            while self._thread is not None and self._thread.is_alive():
+                self._lock.release()
+                try:
+                    self._stop_event.wait(timeout=5)
+                finally:
+                    self._lock.acquire()
+            self._stop_event.clear()
             self._running = True
             self._paused = False
             self._pause_event.set()
@@ -136,11 +148,6 @@ class TransferEngine:
             self._paused = False
             self._pause_event.set()
             self._current_file = None
-            thread = self._thread
-        if thread is not None:
-            thread.join(timeout=30)
-        with self._lock:
-            self._thread = None
         db.reset_stalled_transfers()
         db.add_log("INFO", "Transfer stopped")
 
@@ -149,7 +156,8 @@ class TransferEngine:
             pending = db.get_pending_files()
             total_bytes = sum(f["size"] for f in pending)
             transferred = sum(f["bytes_transferred"] for f in pending)
-        except Exception:
+        except Exception as e:
+            logger.error(f"DB error in get_status: {e}")
             pending = []
             total_bytes = 0
             transferred = 0
@@ -174,62 +182,60 @@ class TransferEngine:
         }
 
     def _transfer_loop(self):
-        while True:
-            with self._lock:
-                running = self._running
-                paused = self._paused
-            if not running:
-                break
-            if paused:
-                self._pause_event.wait()
-                with self._lock:
-                    running = self._running
-                if not running:
-                    break
-                continue
-
-            try:
-                pending = db.get_pending_files()
-            except Exception as e:
-                logger.error(f"DB error in transfer loop: {e}")
-                time.sleep(5)
-                continue
-
-            if not pending:
-                with self._lock:
-                    self._running = False
-                db.add_log("INFO", "All transfers complete")
-                break
-
-            for file_info in pending:
+        try:
+            while True:
                 with self._lock:
                     running = self._running
                     paused = self._paused
                 if not running:
                     break
                 if paused:
-                    break
+                    self._pause_event.wait()
+                    with self._lock:
+                        running = self._running
+                    if not running:
+                        break
+                    continue
 
                 try:
-                    self._transfer_file(file_info)
+                    pending = db.get_pending_files()
                 except Exception as e:
-                    logger.error(f"Failed to transfer {file_info['remote_path']}: {e}")
-                    try:
-                        db.update_file_status(file_info["id"], "failed")
-                        db.add_log("ERROR", f"Failed: {file_info['remote_path']} - {e}")
-                    except Exception as db_err:
-                        logger.error(f"DB update also failed: {db_err}")
-                    with self._lock:
-                        self._stats["failed_files"] += 1
+                    logger.error(f"DB error in transfer loop: {e}")
+                    time.sleep(5)
+                    continue
 
-            with self._lock:
-                running = self._running
-            if not running:
-                pending_again = db.get_pending_files()
-                if pending_again:
+                if not pending:
                     with self._lock:
-                        self._running = True
-                    db.add_log("INFO", "New files detected, continuing transfer")
+                        self._running = False
+                    db.add_log("INFO", "All transfers complete")
+                    break
+
+                for file_info in pending:
+                    with self._lock:
+                        running = self._running
+                        paused = self._paused
+                    if not running:
+                        break
+                    if paused:
+                        break
+
+                    try:
+                        self._transfer_file(file_info)
+                    except Exception as e:
+                        logger.error(f"Failed to transfer {file_info['remote_path']}: {e}")
+                        try:
+                            db.update_file_status(file_info["id"], "failed")
+                            db.add_log("ERROR", f"Failed: {file_info['remote_path']} - {e}")
+                        except Exception as db_err:
+                            logger.error(f"DB update also failed: {db_err}")
+                        with self._lock:
+                            self._stats["failed_files"] += 1
+
+                if not running:
+                    break
+
+        finally:
+            self._stop_event.set()
 
     def _transfer_file(self, file_info):
         file_id = file_info["id"]
@@ -263,7 +269,12 @@ class TransferEngine:
                         raise Exception("Reconnect failed")
 
                 local_tmp = local_path + ".tmp"
-                last_bytes = 0
+
+                existing_tmp_size = 0
+                if os.path.exists(local_tmp):
+                    existing_tmp_size = os.path.getsize(local_tmp)
+
+                last_bytes = existing_tmp_size
                 last_time = time.time()
 
                 def progress_callback(bytes_transferred, total):
@@ -286,8 +297,13 @@ class TransferEngine:
                         return
 
                 if os.path.exists(local_tmp) and os.path.getsize(local_tmp) != expected_size:
+                    actual_size = os.path.getsize(local_tmp)
+                    try:
+                        os.remove(local_tmp)
+                    except OSError:
+                        pass
                     raise Exception(
-                        f"Size mismatch: expected {expected_size}, got {os.path.getsize(local_tmp)}"
+                        f"Size mismatch: expected {expected_size}, got {actual_size}"
                     )
 
                 checksum = file_info.get("checksum")
@@ -301,6 +317,10 @@ class TransferEngine:
 
                 if checksum:
                     if not self.ssh.verify_checksum(local_tmp, checksum):
+                        try:
+                            os.remove(local_tmp)
+                        except OSError:
+                            pass
                         raise Exception("Checksum mismatch")
 
                 with self._lock:
@@ -308,9 +328,12 @@ class TransferEngine:
                         self._current_file = None
                         return
 
-                os.replace(local_tmp, local_path)
-                db.update_file_status(file_id, "complete")
-                db.update_progress(file_id, expected_size)
+                self._atomic_replace(local_tmp, local_path)
+                try:
+                    db.update_file_status(file_id, "complete")
+                    db.update_progress(file_id, expected_size)
+                except Exception as db_err:
+                    logger.error(f"DB update failed after transfer of {remote_path}: {db_err}")
                 with self._lock:
                     self._stats["completed_files"] += 1
                     self._current_file = None
@@ -340,18 +363,8 @@ class TransferEngine:
                     while time.time() < deadline:
                         with self._lock:
                             running = self._running
-                            paused = self._paused
                         if not running:
                             break
-                        if paused:
-                            self._pause_event.wait()
-                            with self._lock:
-                                running = self._running
-                                paused = self._paused
-                            if not running:
-                                break
-                            if paused:
-                                break
                         time.sleep(0.5)
                     with self._lock:
                         running = self._running
@@ -369,3 +382,25 @@ class TransferEngine:
         with self._lock:
             self._current_file = None
         raise Exception(f"Failed after {max_retries} attempts")
+
+    def _atomic_replace(self, src, dst):
+        for attempt in range(REPLACE_MAX_RETRIES):
+            try:
+                os.replace(src, dst)
+                return
+            except OSError as e:
+                logger.warning(f"Replace attempt {attempt + 1} failed: {e}")
+                if attempt < REPLACE_MAX_RETRIES - 1:
+                    time.sleep(REPLACE_RETRY_DELAY * (attempt + 1))
+        try:
+            shutil.move(src, dst)
+            return
+        except OSError:
+            pass
+        try:
+            os.remove(dst)
+            os.replace(src, dst)
+            return
+        except OSError:
+            pass
+        raise OSError(f"Failed to move {src} to {dst} after {REPLACE_MAX_RETRIES} attempts")

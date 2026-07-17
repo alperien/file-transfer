@@ -1,5 +1,6 @@
 import logging
 import logging.handlers
+import sys
 import threading
 
 from flask import Flask, jsonify, render_template, request
@@ -41,44 +42,56 @@ def _validate_config_types(new_config):
     errors = []
     if "ssh" in new_config:
         ssh = new_config["ssh"]
-        if "host" in ssh and not isinstance(ssh["host"], str):
-            errors.append("ssh.host must be a string")
-        if "port" in ssh:
-            if not isinstance(ssh["port"], int) or not (1 <= ssh["port"] <= 65535):
-                errors.append("ssh.port must be an integer 1-65535")
-        if "user" in ssh and not isinstance(ssh["user"], str):
-            errors.append("ssh.user must be a string")
-        if "key_path" in ssh and not isinstance(ssh["key_path"], str):
-            errors.append("ssh.key_path must be a string")
-        if "password" in ssh and not isinstance(ssh["password"], str):
-            errors.append("ssh.password must be a string")
+        if not isinstance(ssh, dict):
+            errors.append("ssh must be a dict")
+        else:
+            if "host" in ssh and not isinstance(ssh["host"], str):
+                errors.append("ssh.host must be a string")
+            if "port" in ssh:
+                if not isinstance(ssh["port"], int) or not (1 <= ssh["port"] <= 65535):
+                    errors.append("ssh.port must be an integer 1-65535")
+            if "user" in ssh and not isinstance(ssh["user"], str):
+                errors.append("ssh.user must be a string")
+            if "key_path" in ssh and not isinstance(ssh["key_path"], str):
+                errors.append("ssh.key_path must be a string")
+            if "password" in ssh and not isinstance(ssh["password"], str):
+                errors.append("ssh.password must be a string")
     if "paths" in new_config:
         paths = new_config["paths"]
-        if "source" in paths and not isinstance(paths["source"], str):
-            errors.append("paths.source must be a string")
-        if "destination" in paths and not isinstance(paths["destination"], str):
-            errors.append("paths.destination must be a string")
+        if not isinstance(paths, dict):
+            errors.append("paths must be a dict")
+        else:
+            if "source" in paths and not isinstance(paths["source"], str):
+                errors.append("paths.source must be a string")
+            if "destination" in paths and not isinstance(paths["destination"], str):
+                errors.append("paths.destination must be a string")
     if "transfer" in new_config:
         t = new_config["transfer"]
-        if "chunk_size" in t:
-            if not isinstance(t["chunk_size"], int) or t["chunk_size"] <= 0:
-                errors.append("transfer.chunk_size must be a positive integer")
-        if "max_retries" in t:
-            if not isinstance(t["max_retries"], int) or t["max_retries"] < 1:
-                errors.append("transfer.max_retries must be an integer >= 1")
-        if "retry_delay" in t:
-            if not isinstance(t["retry_delay"], (int, float)) or t["retry_delay"] < 0:
-                errors.append("transfer.retry_delay must be a non-negative number")
-        if "timeout" in t:
-            if not isinstance(t["timeout"], (int, float)) or t["timeout"] < 1:
-                errors.append("transfer.timeout must be a positive number")
+        if not isinstance(t, dict):
+            errors.append("transfer must be a dict")
+        else:
+            if "chunk_size" in t:
+                if not isinstance(t["chunk_size"], int) or t["chunk_size"] <= 0:
+                    errors.append("transfer.chunk_size must be a positive integer")
+            if "max_retries" in t:
+                if not isinstance(t["max_retries"], int) or t["max_retries"] < 1:
+                    errors.append("transfer.max_retries must be an integer >= 1")
+            if "retry_delay" in t:
+                if not isinstance(t["retry_delay"], (int, float)) or t["retry_delay"] < 0:
+                    errors.append("transfer.retry_delay must be a non-negative number")
+            if "timeout" in t:
+                if not isinstance(t["timeout"], (int, float)) or t["timeout"] < 1:
+                    errors.append("transfer.timeout must be a positive number")
     if "server" in new_config:
         s = new_config["server"]
-        if "host" in s and not isinstance(s["host"], str):
-            errors.append("server.host must be a string")
-        if "port" in s:
-            if not isinstance(s["port"], int) or not (1 <= s["port"] <= 65535):
-                errors.append("server.port must be an integer 1-65535")
+        if not isinstance(s, dict):
+            errors.append("server must be a dict")
+        else:
+            if "host" in s and not isinstance(s["host"], str):
+                errors.append("server.host must be a string")
+            if "port" in s:
+                if not isinstance(s["port"], int) or not (1 <= s["port"] <= 65535):
+                    errors.append("server.port must be an integer 1-65535")
     return errors
 
 
@@ -86,6 +99,8 @@ def _is_within_source(path, source):
     norm_source = posixpath.normpath(source)
     norm_path = posixpath.normpath(path)
     if norm_path == norm_source:
+        return True
+    if norm_source == "/":
         return True
     return norm_path.startswith(norm_source + "/")
 
@@ -190,7 +205,7 @@ def list_files():
     norm_source = posixpath.normpath(source)
     norm_path = posixpath.normpath(path)
 
-    if norm_path != norm_source and not norm_path.startswith(norm_source + "/"):
+    if not _is_within_source(path, source):
         return jsonify({"ok": False, "message": "Access denied: path outside source directory"}), 403
 
     try:
@@ -213,7 +228,6 @@ def queue_files():
 
     with _config_lock:
         source = config["paths"]["source"]
-    norm_source = posixpath.normpath(source)
 
     valid_files = []
     rejected = 0
@@ -221,11 +235,19 @@ def queue_files():
         if not isinstance(f, dict) or not isinstance(f.get("path"), str) or not f["path"]:
             rejected += 1
             continue
-        norm_path = posixpath.normpath(f["path"])
-        if norm_path != norm_source and not norm_path.startswith(norm_source + "/"):
+        if not _is_within_source(f["path"], source):
             rejected += 1
             continue
-        valid_files.append(f)
+        mtime = f.get("mtime")
+        if mtime is not None and not isinstance(mtime, (int, float)):
+            mtime = None
+        valid_files.append({
+            "path": f["path"],
+            "name": f.get("name", f["path"].rsplit("/", 1)[-1]),
+            "is_dir": bool(f.get("is_dir", False)),
+            "size": int(f.get("size", 0)),
+            "mtime": mtime,
+        })
 
     try:
         count = engine.add_files_to_queue(valid_files)
@@ -282,7 +304,11 @@ def stop_transfer():
 
 @app.route("/api/transfer/status")
 def transfer_status():
-    return jsonify(engine.get_status())
+    try:
+        return jsonify(engine.get_status())
+    except Exception as e:
+        logger.error("transfer_status failed: %s", e)
+        return jsonify({"ok": False, "message": "Failed to get status"}), 500
 
 
 @app.route("/api/queue/files")
@@ -308,6 +334,7 @@ def clear_queue():
 @app.route("/api/logs")
 def get_logs():
     limit = request.args.get("limit", 100, type=int)
+    limit = max(1, min(limit, 1000))
     try:
         logs = db.get_logs(limit)
         return jsonify(logs)
@@ -321,6 +348,7 @@ if __name__ == "__main__":
         db.init_db()
     except Exception as e:
         logger.error("Failed to initialize database: %s", e)
+        sys.exit(1)
     logger.info("Starting file transfer server")
     app.run(
         host=config["server"]["host"],
