@@ -1,7 +1,5 @@
 import logging
 import logging.handlers
-import os
-import platform
 import threading
 
 from flask import Flask, jsonify, render_template, request
@@ -10,12 +8,7 @@ import db
 from config import load_config, save_config
 from transfer_engine import TransferEngine
 
-if platform.system() == "Windows":
-    import ntpath
-    pathmod = ntpath
-else:
-    import posixpath
-    pathmod = posixpath
+import posixpath
 
 logging.basicConfig(
     level=logging.INFO,
@@ -89,6 +82,14 @@ def _validate_config_types(new_config):
     return errors
 
 
+def _is_within_source(path, source):
+    norm_source = posixpath.normpath(source)
+    norm_path = posixpath.normpath(path)
+    if norm_path == norm_source:
+        return True
+    return norm_path.startswith(norm_source + "/")
+
+
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -108,7 +109,7 @@ def get_config():
                 "port": config["ssh"]["port"],
                 "user": config["ssh"]["user"],
                 "key_path": config["ssh"]["key_path"],
-                "password": "***" if config["ssh"].get("password") else "",
+                "password": bool(config["ssh"].get("password")),
             },
             "paths": dict(config["paths"]),
             "transfer": dict(config["transfer"]),
@@ -119,6 +120,8 @@ def get_config():
 
 @app.route("/api/config", methods=["POST"])
 def update_config():
+    # NOTE: update_config does not notify the engine; a reconnect is
+    # required for SSH config changes to take effect.
     new_config = _get_json()
     if not new_config:
         return jsonify({"ok": False, "message": "Invalid JSON"}), 400
@@ -160,16 +163,22 @@ def connect():
         engine.connect()
         return jsonify({"ok": True, "message": "Connected"})
     except Exception as e:
-        return jsonify({"ok": False, "message": str(e)}), 400
+        logger.error("Connection failed: %s", e)
+        return jsonify({"ok": False, "message": "Failed to connect to remote server"}), 502
 
 
+# NOTE: No CSRF protection is implemented. This is acceptable for a local
+# personal-use project but would be required for any internet-facing deployment.
 @app.route("/api/disconnect", methods=["POST"])
 def disconnect():
     try:
+        if engine.get_status().get("running"):
+            engine.stop()
         engine.disconnect()
         return jsonify({"ok": True})
     except Exception as e:
-        return jsonify({"ok": False, "message": str(e)}), 400
+        logger.error("Disconnect failed: %s", e)
+        return jsonify({"ok": False, "message": "Failed to disconnect"}), 500
 
 
 @app.route("/api/files")
@@ -178,19 +187,18 @@ def list_files():
         source = config["paths"]["source"]
     path = request.args.get("path", source)
 
-    norm_source = pathmod.normpath(source)
-    norm_path = pathmod.normpath(path)
+    norm_source = posixpath.normpath(source)
+    norm_path = posixpath.normpath(path)
 
-    if norm_path != norm_source:
-        has_sep = norm_path.startswith(norm_source + pathmod.sep) or norm_path.startswith(norm_source + "/")
-        if not has_sep:
-            return jsonify({"ok": False, "message": "Access denied: path outside source directory"}), 403
+    if norm_path != norm_source and not norm_path.startswith(norm_source + "/"):
+        return jsonify({"ok": False, "message": "Access denied: path outside source directory"}), 403
 
     try:
         files = engine.list_remote_files(path)
         return jsonify({"ok": True, "files": files})
     except Exception as e:
-        return jsonify({"ok": False, "message": str(e)}), 400
+        logger.error("list_remote_files failed: %s", e)
+        return jsonify({"ok": False, "message": "Failed to list remote files"}), 500
 
 
 @app.route("/api/queue", methods=["POST"])
@@ -203,25 +211,43 @@ def queue_files():
     if not isinstance(files, list):
         return jsonify({"ok": False, "message": "files must be a list"}), 400
 
-    valid_files = [f for f in files if isinstance(f, dict) and "path" in f]
+    with _config_lock:
+        source = config["paths"]["source"]
+    norm_source = posixpath.normpath(source)
+
+    valid_files = []
+    rejected = 0
+    for f in files:
+        if not isinstance(f, dict) or not isinstance(f.get("path"), str) or not f["path"]:
+            rejected += 1
+            continue
+        norm_path = posixpath.normpath(f["path"])
+        if norm_path != norm_source and not norm_path.startswith(norm_source + "/"):
+            rejected += 1
+            continue
+        valid_files.append(f)
 
     try:
         count = engine.add_files_to_queue(valid_files)
-        return jsonify({"ok": True, "added": count})
+        result = {"ok": True, "added": count}
+        if rejected:
+            result["rejected"] = rejected
+        return jsonify(result)
     except Exception as e:
-        return jsonify({"ok": False, "message": str(e)}), 400
+        logger.error("add_files_to_queue failed: %s", e)
+        return jsonify({"ok": False, "message": "Failed to queue files"}), 500
 
 
 @app.route("/api/transfer/start", methods=["POST"])
 def start_transfer():
-    with engine._lock:
-        try:
-            if not engine.is_connected():
-                engine.connect()
-            engine.start()
-            return jsonify({"ok": True})
-        except Exception as e:
-            return jsonify({"ok": False, "message": str(e)}), 400
+    try:
+        if not engine.is_connected():
+            engine.connect()
+        engine.start()
+        return jsonify({"ok": True})
+    except Exception as e:
+        logger.error("start_transfer failed: %s", e)
+        return jsonify({"ok": False, "message": "Failed to start transfer"}), 500
 
 
 @app.route("/api/transfer/pause", methods=["POST"])
@@ -230,7 +256,8 @@ def pause_transfer():
         engine.pause()
         return jsonify({"ok": True})
     except Exception as e:
-        return jsonify({"ok": False, "message": str(e)}), 400
+        logger.error("pause_transfer failed: %s", e)
+        return jsonify({"ok": False, "message": "Failed to pause transfer"}), 500
 
 
 @app.route("/api/transfer/resume", methods=["POST"])
@@ -239,7 +266,8 @@ def resume_transfer():
         engine.resume()
         return jsonify({"ok": True})
     except Exception as e:
-        return jsonify({"ok": False, "message": str(e)}), 400
+        logger.error("resume_transfer failed: %s", e)
+        return jsonify({"ok": False, "message": "Failed to resume transfer"}), 500
 
 
 @app.route("/api/transfer/stop", methods=["POST"])
@@ -248,7 +276,8 @@ def stop_transfer():
         engine.stop()
         return jsonify({"ok": True})
     except Exception as e:
-        return jsonify({"ok": False, "message": str(e)}), 400
+        logger.error("stop_transfer failed: %s", e)
+        return jsonify({"ok": False, "message": "Failed to stop transfer"}), 500
 
 
 @app.route("/api/transfer/status")
@@ -260,9 +289,10 @@ def transfer_status():
 def queue_files_list():
     try:
         files = db.get_all_files()
-        return jsonify(files)
+        return jsonify({"ok": True, "files": files})
     except Exception as e:
-        return jsonify({"ok": False, "message": str(e)}), 400
+        logger.error("get_all_files failed: %s", e)
+        return jsonify({"ok": False, "message": "Failed to retrieve queue"}), 500
 
 
 @app.route("/api/queue/clear", methods=["POST"])
@@ -271,7 +301,8 @@ def clear_queue():
         db.clear_completed()
         return jsonify({"ok": True})
     except Exception as e:
-        return jsonify({"ok": False, "message": str(e)}), 400
+        logger.error("clear_queue failed: %s", e)
+        return jsonify({"ok": False, "message": "Failed to clear queue"}), 500
 
 
 @app.route("/api/logs")
@@ -281,10 +312,15 @@ def get_logs():
         logs = db.get_logs(limit)
         return jsonify(logs)
     except Exception as e:
-        return jsonify({"ok": False, "message": str(e)}), 400
+        logger.error("get_logs failed: %s", e)
+        return jsonify({"ok": False, "message": "Failed to retrieve logs"}), 500
 
 
 if __name__ == "__main__":
+    try:
+        db.init_db()
+    except Exception as e:
+        logger.error("Failed to initialize database: %s", e)
     logger.info("Starting file transfer server")
     app.run(
         host=config["server"]["host"],

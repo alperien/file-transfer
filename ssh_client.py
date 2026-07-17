@@ -16,8 +16,8 @@ class SSHFileClient:
         self.client = None
         self.sftp = None
         self._connected = False
-        self._lock = threading.Lock()
-        self._reconnect_lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._reconnect_lock = threading.RLock()
 
         chunk_size = config["transfer"]["chunk_size"]
         if not isinstance(chunk_size, int) or chunk_size <= 0:
@@ -31,29 +31,29 @@ class SSHFileClient:
             return self._do_connect()
 
     def _do_connect(self):
-        ssh_config = self.config["ssh"]
-        self.client = paramiko.SSHClient()
-        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-        connect_kwargs = {
-            "hostname": ssh_config["host"],
-            "port": ssh_config["port"],
-            "username": ssh_config["user"],
-            "timeout": self.config["transfer"]["timeout"],
-        }
-
-        key_path = os.path.expanduser(ssh_config["key_path"])
-        if os.path.exists(key_path):
-            connect_kwargs["key_filename"] = key_path
-            logger.info(f"Connecting with key: {key_path}")
-        elif ssh_config.get("password"):
-            connect_kwargs["password"] = ssh_config["password"]
-            logger.info("Connecting with password")
-        else:
-            connect_kwargs["look_for_keys"] = True
-            logger.info("Connecting with default SSH keys")
-
         try:
+            ssh_config = self.config["ssh"]
+            self.client = paramiko.SSHClient()
+            self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+            connect_kwargs = {
+                "hostname": ssh_config["host"],
+                "port": ssh_config["port"],
+                "username": ssh_config["user"],
+                "timeout": self.config["transfer"]["timeout"],
+            }
+
+            key_path = os.path.expanduser(ssh_config["key_path"])
+            if os.path.exists(key_path):
+                connect_kwargs["key_filename"] = key_path
+                logger.info(f"Connecting with key: {key_path}")
+            elif ssh_config.get("password"):
+                connect_kwargs["password"] = ssh_config["password"]
+                logger.info("Connecting with password")
+            else:
+                connect_kwargs["look_for_keys"] = True
+                logger.info("Connecting with default SSH keys")
+
             self.client.connect(**connect_kwargs)
             transport = self.client.get_transport()
             if transport:
@@ -92,13 +92,34 @@ class SSHFileClient:
             return False
         try:
             transport = self.client.get_transport()
-            return transport and transport.is_active()
+            if not transport:
+                return False
+            if transport.is_active():
+                return True
+            if transport.sock is not None and not transport.sock.closed:
+                return True
+            return False
         except Exception:
             return False
 
     def is_connected(self):
         with self._lock:
             return self._check_transport()
+
+    def _is_connection_error(self, exc):
+        if isinstance(exc, (EOFError, paramiko.SSHException)):
+            return True
+        if isinstance(exc, OSError):
+            connection_codes = {
+                10054,  # WSAECONNRESET
+                10053,  # WSAECONNABORTED
+                10060,  # WSAETIMEDOUT
+                10061,  # WSAECONNREFUSED
+                9,      # EBADF
+                107,    # ENOTCONN
+            }
+            return getattr(exc, "errno", None) in connection_codes
+        return False
 
     def reconnect(self):
         with self._reconnect_lock:
@@ -107,17 +128,15 @@ class SSHFileClient:
                 delay = self.config["transfer"]["retry_delay"]
 
             for attempt in range(max_retries):
+                logger.info(f"Reconnect attempt {attempt + 1}/{max_retries}")
+                time.sleep(delay * (attempt + 1))
                 try:
-                    logger.info(f"Reconnect attempt {attempt + 1}/{max_retries}")
                     with self._lock:
                         self._cleanup()
-                        time.sleep(delay * (attempt + 1))
                         self._do_connect()
                     return True
                 except Exception as e:
                     logger.warning(f"Reconnect failed: {e}")
-                    if attempt < max_retries - 1:
-                        time.sleep(delay * (attempt + 1))
 
             logger.error("Failed to reconnect after all attempts")
             return False
@@ -163,17 +182,21 @@ class SSHFileClient:
             entries.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
             return entries
         except Exception as e:
-            logger.error(f"Failed to list files: {e}")
-            self._mark_disconnected()
+            if self._is_connection_error(e):
+                self._mark_disconnected()
             raise
 
     def get_file_size(self, remote_path):
         self._ensure_connected()
-        stat = self._sftp_op(self.sftp.stat, remote_path)
-        return stat.st_size
+        file_stat = self._sftp_op(self.sftp.stat, remote_path)
+        return file_stat.st_size
 
     def download_file(self, remote_path, local_path, progress_callback=None):
         self._ensure_connected()
+        # NOTE: TOCTOU - remote_size is fetched before the actual read. The file
+        # could grow or shrink between the stat and the open/read. This is
+        # inherent to the two-step approach and cannot be fully eliminated
+        # without combining stat+open into a single atomic SFTP operation.
         remote_size = self.get_file_size(remote_path)
 
         local_tmp = local_path + ".tmp"
@@ -195,7 +218,17 @@ class SSHFileClient:
         chunk_size = self.config["transfer"]["chunk_size"]
 
         try:
-            with self.sftp.open(remote_path, "rb") as remote_file:
+            remote_file = self._sftp_op(self.sftp.open, remote_path, "rb")
+        except Exception:
+            try:
+                if os.path.exists(local_tmp):
+                    os.remove(local_tmp)
+            except Exception:
+                pass
+            raise
+
+        try:
+            with remote_file:
                 if local_size > 0:
                     remote_file.seek(local_size)
                     logger.info(f"Resuming from {local_size} bytes")
@@ -219,6 +252,8 @@ class SSHFileClient:
 
             return True, remote_size
         except Exception as e:
+            if self._is_connection_error(e):
+                self._mark_disconnected()
             logger.error(f"Download failed for {remote_path}: {e}")
             try:
                 if os.path.exists(local_tmp):
@@ -234,19 +269,29 @@ class SSHFileClient:
         md5 = hashlib.md5()
         chunk_size = self.config["transfer"]["chunk_size"]
 
-        with self.sftp.open(remote_path, "rb") as f:
-            bytes_read = 0
-            while bytes_read < remote_size:
-                to_read = min(chunk_size, remote_size - bytes_read)
-                chunk = f.read(to_read)
-                if not chunk:
-                    raise Exception(
-                        f"Premature EOF reading checksum: got {bytes_read}/{remote_size} bytes"
-                    )
-                md5.update(chunk)
-                bytes_read += len(chunk)
+        try:
+            remote_file = self._sftp_op(self.sftp.open, remote_path, "rb")
+        except Exception:
+            raise
 
-        return md5.hexdigest()
+        try:
+            with remote_file:
+                bytes_read = 0
+                while bytes_read < remote_size:
+                    to_read = min(chunk_size, remote_size - bytes_read)
+                    chunk = remote_file.read(to_read)
+                    if not chunk:
+                        raise Exception(
+                            f"Premature EOF reading checksum: got {bytes_read}/{remote_size} bytes"
+                        )
+                    md5.update(chunk)
+                    bytes_read += len(chunk)
+
+            return md5.hexdigest()
+        except Exception as e:
+            if self._is_connection_error(e):
+                self._mark_disconnected()
+            raise
 
     def verify_checksum(self, local_path, expected_checksum):
         try:

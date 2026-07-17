@@ -1,5 +1,5 @@
 paths:
-  destination: '''D:\media\Neon Genesis Evangelion'''
+  destination: "D:\\media\\Neon Genesis Evangelion"
   source: /root
 server:
   host: 0.0.0.0

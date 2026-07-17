@@ -4,17 +4,24 @@ let selectedFiles = [];
 let refreshInterval = null;
 let browseAbort = null;
 
-async function api(url, method = "GET", body = null) {
+async function api(url, method = "GET", body = null, signal = null) {
     const opts = {
         method,
         headers: { "Content-Type": "application/json" },
     };
     if (body) opts.body = JSON.stringify(body);
+    if (signal) opts.signal = signal;
     try {
         const res = await fetch(url, opts);
         const text = await res.text();
-        try { return JSON.parse(text); }
-        catch (e) { return { ok: false, message: "Invalid JSON response" }; }
+        let data;
+        try { data = JSON.parse(text); }
+        catch (e) { data = { ok: false, message: "Invalid JSON response" }; }
+        if (!res.ok) {
+            data.ok = false;
+            if (!data.message) data.message = "HTTP " + res.status + ": " + res.statusText;
+        }
+        return data;
     } catch (e) {
         return { ok: false, message: "Network error: " + e.message };
     }
@@ -25,26 +32,32 @@ function showMainPanel() {
 }
 
 async function loadConfig() {
-    const cfg = await api("/api/config");
-    if (!cfg || !cfg.ssh) return;
-    if (cfg.ssh) {
-        document.getElementById("ssh-host").value = cfg.ssh.host || "";
-        document.getElementById("ssh-port").value = cfg.ssh.port || 22;
-        document.getElementById("ssh-user").value = cfg.ssh.user || "";
-        document.getElementById("ssh-key").value = cfg.ssh.key_path || "";
-    }
-    if (cfg.paths) {
-        document.getElementById("path-source").value = cfg.paths.source || "";
-        document.getElementById("path-dest").value = cfg.paths.destination || "";
+    try {
+        const cfg = await api("/api/config");
+        if (!cfg || !cfg.ssh) return;
+        if (cfg.ssh) {
+            document.getElementById("ssh-host").value = cfg.ssh.host || "";
+            document.getElementById("ssh-port").value = cfg.ssh.port || 22;
+            document.getElementById("ssh-user").value = cfg.ssh.user || "";
+            document.getElementById("ssh-key").value = cfg.ssh.key_path || "";
+        }
+        if (cfg.paths) {
+            document.getElementById("path-source").value = cfg.paths.source || "";
+            document.getElementById("path-dest").value = cfg.paths.destination || "";
+        }
+    } catch (e) {
+        addLog("ERROR", "load config failed: " + e.message);
     }
 }
 
 async function saveConfig() {
+    const portVal = parseInt(document.getElementById("ssh-port").value);
     const res = await api("/api/config", "POST", {
         ssh: {
             host: document.getElementById("ssh-host").value,
-            port: parseInt(document.getElementById("ssh-port").value),
+            port: isNaN(portVal) ? 22 : portVal,
             user: document.getElementById("ssh-user").value,
+            password: document.getElementById("ssh-password").value,
             key_path: document.getElementById("ssh-key").value,
         },
         paths: {
@@ -87,6 +100,10 @@ async function connect() {
 }
 
 async function disconnect() {
+    const status = await api("/api/transfer/status");
+    if (status && status.running) {
+        await stopTransfer();
+    }
     const res = await api("/api/disconnect", "POST");
     stopAutoRefresh();
     setConnectedState(false);
@@ -102,7 +119,7 @@ async function browseFiles(path) {
     selectedFiles = [];
     updateBreadcrumb(path);
     try {
-        const result = await api("/api/files?path=" + encodeURIComponent(path));
+        const result = await api("/api/files?path=" + encodeURIComponent(path), "GET", null, browseAbort.signal);
         if (!result || !result.ok) {
             addLog("ERROR", "browse failed: " + (result ? result.message : "no response"));
             return;
@@ -185,6 +202,7 @@ function renderFileList(files) {
     list.querySelectorAll('input[type="checkbox"]').forEach(el => {
         el.addEventListener("click", (e) => {
             e.stopPropagation();
+            if (_clickTimer) { clearTimeout(_clickTimer); _clickTimer = null; }
             toggleFile(parseInt(el.dataset.index));
         });
     });
@@ -232,6 +250,13 @@ async function startTransfer() {
         const ok = await addSelectedToQueue();
         if (!ok) return;
     }
+    const queueCheck = await api("/api/queue/files");
+    const queueFiles = queueCheck.ok && Array.isArray(queueCheck.files) ? queueCheck.files : (Array.isArray(queueCheck) ? queueCheck : []);
+    const pendingFiles = queueFiles.filter(f => f.status === "pending" || f.status === "queued");
+    if (pendingFiles.length === 0) {
+        addLog("WARNING", "no files in queue to transfer");
+        return;
+    }
     const res = await api("/api/transfer/start", "POST");
     if (res.ok) { addLog("INFO", "transfer started"); startAutoRefresh(); }
     else addLog("ERROR", "start failed: " + res.message);
@@ -256,98 +281,127 @@ async function stopTransfer() {
 }
 
 async function clearCompleted() {
+    const queueCheck = await api("/api/queue/files");
+    const queueFiles = queueCheck.ok && Array.isArray(queueCheck.files) ? queueCheck.files : (Array.isArray(queueCheck) ? queueCheck : []);
+    const hasFailed = queueFiles.some(f => f.status === "failed" || f.status === "error");
+    if (hasFailed) {
+        addLog("WARNING", "clearing completed files (failed files also removed)");
+    }
     const res = await api("/api/queue/clear", "POST");
     if (res.ok) await refreshQueue();
     else addLog("ERROR", "clear failed: " + res.message);
 }
 
 async function refreshQueue() {
-    const files = await api("/api/queue/files");
-    if (!files || !Array.isArray(files)) return;
-    const list = document.getElementById("queue-list");
-    if (files.length === 0) {
-        list.innerHTML = '<div class="dim" style="padding:10px;text-align:center;">empty</div>';
-        return;
+    try {
+        const result = await api("/api/queue/files");
+        let files;
+        if (result && result.ok && Array.isArray(result.files)) {
+            files = result.files;
+        } else if (Array.isArray(result)) {
+            files = result;
+        } else {
+            return;
+        }
+        const list = document.getElementById("queue-list");
+        if (files.length === 0) {
+            list.innerHTML = '<div class="dim" style="padding:10px;text-align:center;">empty</div>';
+            return;
+        }
+        list.innerHTML = files.map(f => {
+            const name = f.remote_path.split("/").pop();
+            const pct = f.size > 0 ? Math.min(100, Math.round((f.bytes_transferred / f.size) * 100)) : 0;
+            const transferred = formatSize(f.bytes_transferred);
+            const total = formatSize(f.size);
+            const bar = f.status === "transferring"
+                ? '<div class="progress-bar"><div class="progress-fill" style="width:' + pct + '%"></div></div>'
+                : "";
+            return '<div class="queue-item">' +
+                '<span class="name">' + escapeHtml(name) + "</span>" +
+                '<span class="meta">' + transferred + "/" + total + " " + pct + "%</span>" +
+                '<span class="st st-' + escapeHtml(f.status) + '">' + escapeHtml(f.status) + "</span></div>" + bar;
+        }).join("");
+    } catch (e) {
+        addLog("ERROR", "refresh queue failed: " + e.message);
     }
-    list.innerHTML = files.map(f => {
-        const name = f.remote_path.split("/").pop();
-        const pct = f.size > 0 ? Math.round((f.bytes_transferred / f.size) * 100) : 0;
-        const transferred = formatSize(f.bytes_transferred);
-        const total = formatSize(f.size);
-        const bar = f.status === "transferring"
-            ? '<div class="progress-bar"><div class="progress-fill" style="width:' + pct + '%"></div></div>'
-            : "";
-        return '<div class="queue-item">' +
-            '<span class="name">' + escapeHtml(name) + "</span>" +
-            '<span class="meta">' + transferred + "/" + total + " " + pct + "%</span>" +
-            '<span class="st st-' + escapeHtml(f.status) + '">' + escapeHtml(f.status) + "</span></div>" + bar;
-    }).join("");
 }
 
 async function refreshStatus() {
-    const s = await api("/api/transfer/status");
-    if (!s || s.connected === undefined) return;
+    try {
+        const s = await api("/api/transfer/status");
+        if (!s || s.connected === undefined) return;
 
-    const dot = document.getElementById("status-dot");
-    const text = document.getElementById("status-text");
+        const dot = document.getElementById("status-dot");
+        const text = document.getElementById("status-text");
 
-    if (s.connected) {
-        dot.style.color = s.running ? "#00ff41" : "#ffaa00";
-        text.textContent = s.running ? (s.paused ? "paused" : "transferring") : "connected";
-    } else {
-        dot.style.color = "#ff0040";
-        text.textContent = "disconnected";
+        if (s.connected) {
+            dot.style.color = s.running ? "#00ff41" : "#ffaa00";
+            text.textContent = s.running ? (s.paused ? "paused" : "transferring") : "connected";
+        } else {
+            dot.style.color = "#ff0040";
+            text.textContent = "disconnected";
+        }
+
+        document.getElementById("status-speed").textContent = formatSpeed(s.speed);
+        document.getElementById("status-files").textContent = (s.completed_files || 0) + "/" + (s.total_files || 0);
+        document.getElementById("status-current").textContent = s.current_file ? s.current_file.remote_path.split("/").pop() : "-";
+
+        const totalBytes = s.total_bytes || 0;
+        const pct = totalBytes > 0 ? Math.min(100, Math.round(((s.transferred_bytes || 0) / totalBytes) * 100)) : 0;
+        document.getElementById("progress-fill").style.width = pct + "%";
+
+        document.getElementById("btn-pause").disabled = !s.running || s.paused;
+        document.getElementById("btn-resume").disabled = !s.running || !s.paused;
+        document.getElementById("btn-stop").disabled = !s.running;
+    } catch (e) {
+        addLog("ERROR", "refresh status failed: " + e.message);
     }
+}
 
-    document.getElementById("status-speed").textContent = formatSpeed(s.speed);
-    document.getElementById("status-files").textContent = (s.completed_files || 0) + "/" + (s.total_files || 0);
-    document.getElementById("status-current").textContent = s.current_file ? s.current_file.remote_path.split("/").pop() : "-";
-
-    const totalBytes = s.total_bytes || 0;
-    const pct = totalBytes > 0 ? Math.round(((s.transferred_bytes || 0) / totalBytes) * 100) : 0;
-    document.getElementById("progress-fill").style.width = pct + "%";
-
-    document.getElementById("btn-pause").disabled = !s.running || s.paused;
-    document.getElementById("btn-resume").disabled = !s.running || !s.paused;
-    document.getElementById("btn-stop").disabled = !s.running;
+function parseLogTimestamp(ts) {
+    if (!ts) return "--:--:--";
+    if (ts.indexOf("T") >= 0) {
+        const timePart = ts.split("T")[1];
+        if (timePart) return timePart.split(".")[0];
+    }
+    if (ts.indexOf(" ") >= 0) {
+        return ts.split(" ")[1];
+    }
+    return ts;
 }
 
 async function refreshLogs() {
-    const logs = await api("/api/logs?limit=50");
-    if (!logs || !Array.isArray(logs)) return;
-    const el = document.getElementById("logs");
-    el.innerHTML = logs.map(l => {
-        const t = l.timestamp ? l.timestamp.split("T")[1].split(".")[0] : "--:--:--";
-        const lvl = (l.level || "I").charAt(0).toLowerCase();
-        const cls = lvl === "e" ? "lvl-E" : lvl === "w" ? "lvl-W" : "lvl-I";
-        return '<div class="log-entry"><span class="time">' + escapeHtml(t) +
-            '</span> <span class="' + cls + '">' + escapeHtml(l.level || "I") +
-            "</span> " + escapeHtml(l.message || "") + "</div>";
-    }).join("");
-    el.scrollTop = el.scrollHeight;
+    try {
+        const logs = await api("/api/logs?limit=50");
+        if (!logs || !Array.isArray(logs)) return;
+        const el = document.getElementById("logs");
+        el.innerHTML = logs.map(l => {
+            const t = parseLogTimestamp(l.timestamp);
+            const lvl = (l.level || "I").charAt(0).toLowerCase();
+            const cls = lvl === "e" ? "lvl-E" : lvl === "w" ? "lvl-W" : "lvl-I";
+            return '<div class="log-entry"><span class="time">' + escapeHtml(t) +
+                '</span> <span class="' + cls + '">' + escapeHtml(l.level || "I") +
+                "</span> " + escapeHtml(l.message || "") + "</div>";
+        }).join("");
+        el.scrollTop = el.scrollHeight;
+    } catch (e) {
+        addLog("ERROR", "refresh logs failed: " + e.message);
+    }
 }
-
-let _refreshPending = false;
 
 function startAutoRefresh() {
     if (refreshInterval) return;
-    async function tick() {
-        if (_refreshPending) return;
-        _refreshPending = true;
+    refreshInterval = setInterval(async () => {
         try {
             await Promise.all([refreshStatus(), refreshQueue(), refreshLogs()]);
-        } finally {
-            _refreshPending = false;
+        } catch (e) {
+            addLog("ERROR", "auto-refresh failed: " + e.message);
         }
-        if (refreshInterval) {
-            refreshInterval = setTimeout(tick, 1000);
-        }
-    }
-    refreshInterval = setTimeout(tick, 1000);
+    }, 1000);
 }
 
 function stopAutoRefresh() {
-    if (refreshInterval) { clearTimeout(refreshInterval); refreshInterval = null; }
+    if (refreshInterval) { clearInterval(refreshInterval); refreshInterval = null; }
 }
 
 function addLog(level, message) {
@@ -356,9 +410,10 @@ function addLog(level, message) {
     const now = new Date().toTimeString().split(" ")[0];
     const lvl = (level || "I").charAt(0).toLowerCase();
     const cls = lvl === "e" ? "lvl-E" : lvl === "w" ? "lvl-W" : "lvl-I";
-    el.innerHTML += '<div class="log-entry"><span class="time">' + now +
+    el.insertAdjacentHTML("beforeend",
+        '<div class="log-entry"><span class="time">' + now +
         '</span> <span class="' + cls + '">' + escapeHtml(level) +
-        "</span> " + escapeHtml(message) + "</div>";
+        "</span> " + escapeHtml(message) + "</div>");
     el.scrollTop = el.scrollHeight;
 }
 
@@ -376,9 +431,12 @@ function formatSpeed(bps) {
 
 function escapeHtml(text) {
     if (text === null || text === undefined) return "";
-    const d = document.createElement("div");
-    d.textContent = String(text);
-    return d.innerHTML;
+    return String(text)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
 }
 
 loadConfig();
