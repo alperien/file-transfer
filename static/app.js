@@ -330,7 +330,7 @@ async function refreshQueue() {
             return '<div class="queue-item">' +
                 '<span class="name">' + escapeHtml(name) + "</span>" +
                 '<span class="meta">' + transferred + "/" + total + " " + pct + "%</span>" +
-                '<span class="st st-' + escapeHtml(f.status) + '">' + escapeHtml(f.status) + "</span></div>" + bar;
+                '<span class="st st-' + escapeHtml(f.status) + '">' + escapeHtml(f.status) + "</span>" + bar + "</div>";
         }).join("");
     } catch (e) {
         addLog("ERROR", "refresh queue failed: " + e.message);
@@ -468,4 +468,11 @@ function escapeHtml(text) {
         .replace(/'/g, "&#039;");
 }
 
+// On page load: restore config and pick up any transfer that is already
+// running server-side (previously the UI stayed blank until you clicked
+// "connect", even if a transfer was in progress).
 loadConfig();
+refreshStatus();
+refreshQueue();
+refreshLogs();
+startAutoRefresh();

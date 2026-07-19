@@ -10,6 +10,10 @@ import paramiko
 logger = logging.getLogger("ssh_client")
 
 
+class TransferCancelled(Exception):
+    """Raised when a transfer is cancelled by the user (stop)."""
+
+
 class SSHFileClient:
     def __init__(self, config):
         self.config = config
@@ -199,7 +203,7 @@ class SSHFileClient:
             raise Exception(f"Could not determine size of {remote_path}")
         return file_stat.st_size
 
-    def download_file(self, remote_path, local_path, progress_callback=None):
+    def download_file(self, remote_path, local_path, progress_callback=None, cancel_event=None):
         self._ensure_connected()
         remote_size = self.get_file_size(remote_path)
 
@@ -221,6 +225,9 @@ class SSHFileClient:
 
         chunk_size = self.config["transfer"]["chunk_size"]
 
+        # Open the remote file while holding the lock, but do NOT hold the
+        # lock for the whole download: that would block is_connected() /
+        # status polling (and thus the whole UI) until the file finishes.
         with self._lock:
             if not self._check_transport() or not self.sftp:
                 self._cleanup()
@@ -228,49 +235,54 @@ class SSHFileClient:
             try:
                 remote_file = self.sftp.open(remote_path, "rb")
             except Exception as e:
+                if self._is_connection_error(e):
+                    self._connected = False
+                raise
+
+        try:
+            with remote_file:
+                if local_size > 0:
+                    remote_file.seek(local_size)
+                    logger.info(f"Resuming from {local_size} bytes")
+
+                mode = "ab" if local_size > 0 else "wb"
+                with open(local_tmp, mode) as local_file:
+                    bytes_transferred = local_size
+                    while True:
+                        if cancel_event is not None and cancel_event.is_set():
+                            raise TransferCancelled(f"Transfer cancelled: {remote_path}")
+                        chunk = remote_file.read(chunk_size)
+                        if not chunk:
+                            break
+                        local_file.write(chunk)
+                        bytes_transferred += len(chunk)
+                        if progress_callback:
+                            progress_callback(bytes_transferred, remote_size)
+
+            if bytes_transferred != remote_size:
+                raise Exception(
+                    f"Download incomplete: got {bytes_transferred}, expected {remote_size}"
+                )
+
+            return True, remote_size
+        except TransferCancelled:
+            # Keep the .tmp file so the download can be resumed later.
+            logger.info(f"Download cancelled for {remote_path}")
+            raise
+        except Exception as e:
+            if self._is_connection_error(e):
+                # Keep the .tmp file: connection errors are retried and the
+                # partial download can be resumed. Deleting it here made
+                # every retry restart from zero.
+                self._connected = False
+            else:
                 try:
                     if os.path.exists(local_tmp):
                         os.remove(local_tmp)
                 except Exception:
                     pass
-                if self._is_connection_error(e):
-                    self._connected = False
-                raise
-
-            try:
-                with remote_file:
-                    if local_size > 0:
-                        remote_file.seek(local_size)
-                        logger.info(f"Resuming from {local_size} bytes")
-
-                    mode = "ab" if local_size > 0 else "wb"
-                    with open(local_tmp, mode) as local_file:
-                        bytes_transferred = local_size
-                        while True:
-                            chunk = remote_file.read(chunk_size)
-                            if not chunk:
-                                break
-                            local_file.write(chunk)
-                            bytes_transferred += len(chunk)
-                            if progress_callback:
-                                progress_callback(bytes_transferred, remote_size)
-
-                if bytes_transferred != remote_size:
-                    raise Exception(
-                        f"Download incomplete: got {bytes_transferred}, expected {remote_size}"
-                    )
-
-                return True, remote_size
-            except Exception as e:
-                if self._is_connection_error(e):
-                    self._connected = False
-                logger.error(f"Download failed for {remote_path}: {e}")
-                try:
-                    if os.path.exists(local_tmp):
-                        os.remove(local_tmp)
-                except Exception:
-                    pass
-                raise
+            logger.error(f"Download failed for {remote_path}: {e}")
+            raise
 
     def get_checksum(self, remote_path):
         self._ensure_connected()
@@ -279,13 +291,15 @@ class SSHFileClient:
         md5 = hashlib.md5()
         chunk_size = self.config["transfer"]["chunk_size"]
 
+        # Same as download_file: only hold the lock while opening the remote
+        # file, not while streaming it.
         with self._lock:
             if not self._check_transport() or not self.sftp:
                 self._cleanup()
                 raise ConnectionError("SFTP not connected")
             try:
                 remote_file = self.sftp.open(remote_path, "rb")
-            except (EOFError, paramiko.SSHException) as e:
+            except (EOFError, paramiko.SSHException):
                 self._connected = False
                 raise
             except OSError as e:
@@ -293,27 +307,27 @@ class SSHFileClient:
                     self._connected = False
                 raise
 
-            try:
-                with remote_file:
-                    bytes_read = 0
-                    while bytes_read < remote_size:
-                        to_read = min(chunk_size, remote_size - bytes_read)
-                        chunk = remote_file.read(to_read)
-                        if not chunk:
-                            raise Exception(
-                                f"Premature EOF reading checksum: got {bytes_read}/{remote_size} bytes"
-                            )
-                        md5.update(chunk)
-                        bytes_read += len(chunk)
+        try:
+            with remote_file:
+                bytes_read = 0
+                while bytes_read < remote_size:
+                    to_read = min(chunk_size, remote_size - bytes_read)
+                    chunk = remote_file.read(to_read)
+                    if not chunk:
+                        raise Exception(
+                            f"Premature EOF reading checksum: got {bytes_read}/{remote_size} bytes"
+                        )
+                    md5.update(chunk)
+                    bytes_read += len(chunk)
 
-                return md5.hexdigest()
-            except (EOFError, paramiko.SSHException) as e:
+            return md5.hexdigest()
+        except (EOFError, paramiko.SSHException):
+            self._connected = False
+            raise
+        except OSError as e:
+            if self._is_connection_error(e):
                 self._connected = False
-                raise
-            except OSError as e:
-                if self._is_connection_error(e):
-                    self._connected = False
-                raise
+            raise
 
     def verify_checksum(self, local_path, expected_checksum):
         try:
