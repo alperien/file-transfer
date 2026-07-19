@@ -1,0 +1,21 @@
+# Copy this file to config.yaml and fill in your own values.
+# config.yaml is git-ignored on purpose: it contains credentials.
+paths:
+  destination: ~/files
+  source: /home/ubuntu/files
+server:
+  # Keep 127.0.0.1 unless you know what you are doing: the web UI has no
+  # authentication and holds SSH credentials.
+  host: 127.0.0.1
+  port: 5000
+ssh:
+  host: 192.168.1.100
+  key_path: ~/.ssh/id_rsa
+  password: ""
+  port: 22
+  user: ubuntu
+transfer:
+  chunk_size: 65536
+  max_retries: 5
+  retry_delay: 5
+  timeout: 30

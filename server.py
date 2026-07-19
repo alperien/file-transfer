@@ -202,9 +202,6 @@ def list_files():
         source = config["paths"]["source"]
     path = request.args.get("path", source)
 
-    norm_source = posixpath.normpath(source)
-    norm_path = posixpath.normpath(path)
-
     if not _is_within_source(path, source):
         return jsonify({"ok": False, "message": "Access denied: path outside source directory"}), 403
 
@@ -241,11 +238,15 @@ def queue_files():
         mtime = f.get("mtime")
         if mtime is not None and not isinstance(mtime, (int, float)):
             mtime = None
+        try:
+            size = int(f.get("size", 0))
+        except (TypeError, ValueError):
+            size = 0
         valid_files.append({
             "path": f["path"],
             "name": f.get("name", f["path"].rsplit("/", 1)[-1]),
             "is_dir": bool(f.get("is_dir", False)),
-            "size": int(f.get("size", 0)),
+            "size": size,
             "mtime": mtime,
         })
 

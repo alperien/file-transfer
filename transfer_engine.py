@@ -6,7 +6,7 @@ import logging
 import time
 
 import db
-from ssh_client import SSHFileClient
+from ssh_client import SSHFileClient, TransferCancelled
 
 logger = logging.getLogger("transfer")
 
@@ -27,6 +27,7 @@ class TransferEngine:
         self._pause_event.set()
         self._stop_event = threading.Event()
         self._stop_event.set()
+        self._cancel_event = threading.Event()
         self._current_file = None
         self._stats = {
             "completed_files": 0,
@@ -115,13 +116,19 @@ class TransferEngine:
         with self._lock:
             if self._running:
                 return
-            while self._thread is not None and self._thread.is_alive():
-                self._lock.release()
-                try:
-                    self._stop_event.wait(timeout=5)
-                finally:
-                    self._lock.acquire()
+            old_thread = self._thread
+        # Wait for a previous worker thread to shut down without holding the
+        # lock (the old release/acquire dance inside `with self._lock` could
+        # deadlock or corrupt the lock state).
+        if old_thread is not None and old_thread.is_alive():
+            self._stop_event.wait(timeout=30)
+        with self._lock:
+            if self._running:
+                return
+            if self._thread is not None and self._thread.is_alive():
+                raise Exception("Previous transfer is still stopping, try again shortly")
             self._stop_event.clear()
+            self._cancel_event.clear()
             self._running = True
             self._paused = False
             self._pause_event.set()
@@ -147,6 +154,7 @@ class TransferEngine:
             self._running = False
             self._paused = False
             self._pause_event.set()
+            self._cancel_event.set()
             self._current_file = None
         db.reset_stalled_transfers()
         db.add_log("INFO", "Transfer stopped")
@@ -221,6 +229,9 @@ class TransferEngine:
 
                     try:
                         self._transfer_file(file_info)
+                    except TransferCancelled:
+                        logger.info(f"Transfer cancelled: {file_info['remote_path']}")
+                        break
                     except Exception as e:
                         logger.error(f"Failed to transfer {file_info['remote_path']}: {e}")
                         try:
@@ -287,9 +298,17 @@ class TransferEngine:
                             self._stats["speed"] = speed
                         last_bytes = bytes_transferred
                         last_time = now
-                    db.update_progress(file_id, bytes_transferred)
+                        # Persist progress at most once per second. Writing
+                        # (and committing) to SQLite for every 64 KB chunk
+                        # slowed transfers down dramatically.
+                        db.update_progress(file_id, bytes_transferred)
 
-                self.ssh.download_file(remote_path, local_path, progress_callback)
+                self.ssh.download_file(
+                    remote_path,
+                    local_path,
+                    progress_callback,
+                    cancel_event=self._cancel_event,
+                )
 
                 with self._lock:
                     if not self._running:
@@ -341,6 +360,12 @@ class TransferEngine:
                 logger.info(f"Transfer complete: {remote_path}")
                 return
 
+            except TransferCancelled:
+                # Stop was requested: leave the .tmp file for resume and exit
+                # quietly; stop() already resets the DB status to pending.
+                with self._lock:
+                    self._current_file = None
+                raise
             except Exception as e:
                 logger.warning(f"Attempt {attempt + 1} failed for {remote_path}: {e}")
                 if attempt < max_retries - 1:

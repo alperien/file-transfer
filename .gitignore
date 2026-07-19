@@ -4,3 +4,4 @@ transfers.db
 transfer.log
 *.tmp
 .env
+config.yaml

@@ -25,7 +25,9 @@ DEFAULT_CONFIG = {
         "timeout": 30,
     },
     "server": {
-        "host": "0.0.0.0",
+        # Bind to localhost by default: the web UI has no authentication and
+        # holds SSH credentials, so it must not be exposed on all interfaces.
+        "host": "127.0.0.1",
         "port": 5000,
     },
 }
@@ -107,7 +109,8 @@ def load_config():
 
 
 def save_config(config):
-    # NOTE: This writes the password to disk. Acceptable for this personal project.
+    # NOTE: This writes the password to disk. config.yaml is git-ignored;
+    # never commit it to version control.
     dir_name = os.path.dirname(CONFIG_PATH)
     fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
     try:
